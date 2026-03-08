@@ -3,12 +3,12 @@ import {
   SessionManager,
   type ExtensionAPI,
   type ExtensionCommandContext,
+  type ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
 import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
-const AUTO_SYNC_COMMAND = "/branch-session-sync --auto";
 const BRANCH_POLL_MS = 1500;
 const RELOAD_AFTER_SWITCH = true;
 
@@ -23,7 +23,11 @@ type RuntimeState = {
   lastSeenBranch: string | undefined;
   autoEnabled: boolean;
   autoSwitchQueued: boolean;
+  pendingAutoSync: boolean;
   agentBusy: boolean;
+  commandCtx: ExtensionCommandContext | undefined;
+  uiCtx: ExtensionContext | undefined;
+  missingCommandCtxNotified: boolean;
 };
 
 const state: RuntimeState = {
@@ -32,7 +36,11 @@ const state: RuntimeState = {
   lastSeenBranch: undefined,
   autoEnabled: true,
   autoSwitchQueued: false,
+  pendingAutoSync: false,
   agentBusy: false,
+  commandCtx: undefined,
+  uiCtx: undefined,
+  missingCommandCtxNotified: false,
 };
 
 function runGit(cwd: string, args: string[]): GitResult {
@@ -157,22 +165,30 @@ async function syncToCurrentBranch(
   return { switched: !result.cancelled };
 }
 
-function queueAutoSync(pi: ExtensionAPI): void {
-  if (state.autoSwitchQueued) return;
-  state.autoSwitchQueued = true;
+async function runAutoSync(): Promise<void> {
+  if (state.autoSwitchQueued || !state.autoEnabled) return;
 
+  const ctx = state.commandCtx;
+  if (!ctx) {
+    if (!state.missingCommandCtxNotified && state.uiCtx?.hasUI) {
+      state.uiCtx.ui.notify(
+        "Branch changed. Run /branch-session-auto on once in this session to enable auto switching.",
+        "warning",
+      );
+      state.missingCommandCtxNotified = true;
+    }
+    return;
+  }
+
+  state.autoSwitchQueued = true;
   try {
-    if (state.agentBusy) {
-      pi.sendUserMessage(AUTO_SYNC_COMMAND, { deliverAs: "followUp" });
-    } else {
-      pi.sendUserMessage(AUTO_SYNC_COMMAND);
+    const { switched } = await syncToCurrentBranch(ctx, { auto: true });
+    if (switched && RELOAD_AFTER_SWITCH) {
+      await ctx.reload();
+      return;
     }
-  } catch {
-    try {
-      pi.sendUserMessage(AUTO_SYNC_COMMAND, { deliverAs: "followUp" });
-    } catch {
-      state.autoSwitchQueued = false;
-    }
+  } finally {
+    state.autoSwitchQueued = false;
   }
 }
 
@@ -183,7 +199,7 @@ function stopMonitor(): void {
   }
 }
 
-function startMonitor(pi: ExtensionAPI, cwd: string): void {
+function startMonitor(cwd: string): void {
   stopMonitor();
 
   const gitRoot = getGitRoot(cwd);
@@ -214,7 +230,13 @@ function startMonitor(pi: ExtensionAPI, cwd: string): void {
     }
 
     state.lastSeenBranch = branch;
-    queueAutoSync(pi);
+
+    if (state.agentBusy) {
+      state.pendingAutoSync = true;
+      return;
+    }
+
+    void runAutoSync();
   }, BRANCH_POLL_MS);
 }
 
@@ -233,11 +255,13 @@ export default function branchSessionExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event, ctx) => {
-    startMonitor(pi, ctx.cwd);
+    state.uiCtx = ctx;
+    startMonitor(ctx.cwd);
   });
 
   pi.on("session_switch", (_event, ctx) => {
-    startMonitor(pi, ctx.cwd);
+    state.uiCtx = ctx;
+    startMonitor(ctx.cwd);
   });
 
   pi.on("agent_start", () => {
@@ -246,15 +270,28 @@ export default function branchSessionExtension(pi: ExtensionAPI) {
 
   pi.on("agent_end", () => {
     state.agentBusy = false;
+
+    if (state.pendingAutoSync) {
+      state.pendingAutoSync = false;
+      void runAutoSync();
+    }
   });
 
   pi.on("session_shutdown", () => {
     stopMonitor();
+    state.commandCtx = undefined;
+    state.uiCtx = undefined;
+    state.pendingAutoSync = false;
+    state.autoSwitchQueued = false;
   });
 
   pi.registerCommand("branch-session-sync", {
     description: "Switch to the session for the currently checked out git branch",
     handler: async (args, ctx) => {
+      state.commandCtx = ctx;
+      state.uiCtx = ctx;
+      state.missingCommandCtxNotified = false;
+
       const auto = args.includes("--auto");
       const { switched } = await syncToCurrentBranch(ctx, { auto });
 
@@ -263,18 +300,23 @@ export default function branchSessionExtension(pi: ExtensionAPI) {
         return;
       }
 
-      startMonitor(pi, ctx.cwd);
+      startMonitor(ctx.cwd);
     },
   });
 
   pi.registerCommand("branch-session-auto", {
     description: "Enable or disable automatic branch-session switching (usage: /branch-session-auto [on|off|status])",
     handler: async (args, ctx) => {
+      state.commandCtx = ctx;
+      state.uiCtx = ctx;
+      state.missingCommandCtxNotified = false;
+
       const value = args.trim().toLowerCase();
 
       if (value === "off") {
         state.autoEnabled = false;
         state.autoSwitchQueued = false;
+        state.pendingAutoSync = false;
         if (ctx.hasUI) ctx.ui.notify("Branch session auto-switch disabled.", "info");
         return;
       }
@@ -298,7 +340,7 @@ export default function branchSessionExtension(pi: ExtensionAPI) {
         return;
       }
 
-      startMonitor(pi, ctx.cwd);
+      startMonitor(ctx.cwd);
     },
   });
 }

@@ -32,6 +32,8 @@ The extension polls the current git branch. When it detects a branch change, it 
 - OK: switches to that branch session and triggers a runtime reload so the experience matches a fresh launch with that session loaded
 - Cancel: keeps the current session history
 
+Important: because of current extension command invocation limits in pi, auto switch needs one command-context initialization per session. Run `/branch-session-auto on` once after startup.
+
 Commands:
 
 - `/branch-session-sync` - manually switch to current branch session
